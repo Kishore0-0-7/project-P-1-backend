@@ -3,12 +3,17 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
+# Enable bytecode compilation, copy link mode, and prevent external python downloads
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never
+
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Install dependencies (cached layer)
 COPY pyproject.toml uv.lock* ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-install-project
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
