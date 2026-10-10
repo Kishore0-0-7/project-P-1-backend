@@ -274,11 +274,21 @@ class TestHealth:
         assert "version" in data
 
     @pytest.mark.asyncio
+    async def test_health_endpoint_head_method(self, client: AsyncClient):
+        resp = await client.head("/health")
+        assert resp.status_code in (200, 503)
+
+    @pytest.mark.asyncio
     async def test_root_endpoint(self, client: AsyncClient):
         resp = await client.get("/")
         assert resp.status_code == 200
         assert "name" in resp.json()
         assert resp.json()["docs"] == "/docs"
+
+    @pytest.mark.asyncio
+    async def test_root_endpoint_head_method(self, client: AsyncClient):
+        resp = await client.head("/")
+        assert resp.status_code == 200
 
     @pytest.mark.asyncio
     async def test_swagger_ui_endpoint(self, client: AsyncClient):
