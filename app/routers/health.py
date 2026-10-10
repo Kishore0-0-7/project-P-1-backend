@@ -13,6 +13,7 @@ router = APIRouter(tags=["meta"])
 
 
 @router.get("/health", response_model=HealthOut, summary="Health check")
+@router.head("/health", include_in_schema=False)
 async def health(response: Response) -> HealthOut:
     db_status = "ok"
     cache_status = "ok"
@@ -45,5 +46,6 @@ async def health(response: Response) -> HealthOut:
 
 
 @router.get("/", include_in_schema=False)
+@router.head("/", include_in_schema=False)
 async def root() -> dict:
     return {"name": settings.app_name, "version": settings.app_version, "docs": "/docs"}
