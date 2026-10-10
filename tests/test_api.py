@@ -383,3 +383,13 @@ class TestReports:
         assert "sla_summary" in data
         assert "top_anomalous_assets" in data
 
+    @pytest.mark.asyncio
+    async def test_get_timeline_endpoint(self, client: AsyncClient):
+        resp = await client.get("/api/v1/reports/timeline", params={"org_id": ORG_ID, "hours": 12})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, list)
+        assert len(data) == 12
+        assert "label" in data[0]
+        assert "count" in data[0]
+

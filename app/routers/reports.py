@@ -7,7 +7,8 @@ on large time ranges (avoids ORM overhead for GROUP BY aggregations).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
@@ -155,3 +156,109 @@ async def get_report(
     )
     await redis.cache_set(cache_key, report.model_dump(mode="json"), ttl=settings.redis_reports_ttl)
     return report
+
+
+@router.get("/timeline", summary="Signal intake volume timeline")
+async def get_intake_timeline(
+    org_id: str = Query(...),
+    hours: int = Query(12, ge=1, le=72),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict[str, Any]]:
+    await set_org_context(db, org_id)
+    bind = db.bind
+    dialect_name = bind.dialect.name if bind else ""
+    now = datetime.now(timezone.utc)
+
+    # Generate continuous hourly slots
+    slots: dict[str, dict[str, Any]] = {}
+    for i in range(hours - 1, -1, -1):
+        slot_time = now - timedelta(hours=i)
+        key = slot_time.strftime("%Y-%m-%d %H:00")
+        label = slot_time.strftime("%H:00")
+        slots[key] = {
+            "timestamp": slot_time.isoformat(),
+            "label": label,
+            "count": 0,
+        }
+
+    schema = f"{settings.db_schema}." if settings.db_schema else ""
+    if dialect_name == "sqlite":
+        res = await db.execute(
+            text("""
+                SELECT
+                    strftime('%Y-%m-%d %H:00', observed_at) AS bucket,
+                    COUNT(*) AS cnt
+                FROM finding_occurrences
+                WHERE org_id = :org_id
+                  AND observed_at >= datetime('now', '-' || :hours || ' hours')
+                GROUP BY bucket
+            """),
+            {"org_id": org_id, "hours": hours},
+        )
+    else:
+        res = await db.execute(
+            text(f"""
+                SELECT
+                    to_char(date_trunc('hour', observed_at), 'YYYY-MM-DD HH24:00') AS bucket,
+                    COUNT(*) AS cnt
+                FROM {schema}finding_occurrences
+                WHERE org_id = :org_id
+                  AND observed_at >= now() - (:hours * INTERVAL '1 hour')
+                GROUP BY bucket
+            """),
+            {"org_id": org_id, "hours": hours},
+        )
+
+    found_any = False
+    for row in res.fetchall():
+        b_key = str(row[0]).strip()
+        cnt = int(row[1] or 0)
+        if b_key in slots:
+            slots[b_key]["count"] = cnt
+            found_any = True
+        else:
+            for s_key in slots:
+                if s_key[:13] == b_key[:13]:
+                    slots[s_key]["count"] += cnt
+                    found_any = True
+                    break
+
+    if not found_any:
+        if dialect_name == "sqlite":
+            ev_res = await db.execute(
+                text("""
+                    SELECT
+                        strftime('%Y-%m-%d %H:00', occurred_at) AS bucket,
+                        COUNT(*) AS cnt
+                    FROM raw_events
+                    WHERE org_id = :org_id
+                      AND occurred_at >= datetime('now', '-' || :hours || ' hours')
+                    GROUP BY bucket
+                """),
+                {"org_id": org_id, "hours": hours},
+            )
+        else:
+            ev_res = await db.execute(
+                text(f"""
+                    SELECT
+                        to_char(date_trunc('hour', occurred_at), 'YYYY-MM-DD HH24:00') AS bucket,
+                        COUNT(*) AS cnt
+                    FROM {schema}raw_events
+                    WHERE org_id = :org_id
+                      AND occurred_at >= now() - (:hours * INTERVAL '1 hour')
+                    GROUP BY bucket
+                """),
+                {"org_id": org_id, "hours": hours},
+            )
+        for row in ev_res.fetchall():
+            b_key = str(row[0]).strip()
+            cnt = int(row[1] or 0)
+            if b_key in slots:
+                slots[b_key]["count"] = cnt
+            else:
+                for s_key in slots:
+                    if s_key[:13] == b_key[:13]:
+                        slots[s_key]["count"] += cnt
+                        break
+
+    return list(slots.values())
