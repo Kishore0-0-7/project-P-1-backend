@@ -115,17 +115,24 @@ export function handleSummary(data) {
     ? ((cacheHitTotal / totalCacheRequests) * 100).toFixed(1)
     : 'N/A';
 
+  const dur = data.metrics.http_req_duration?.values || {};
+  const p50 = (dur['p(50)'] ?? dur.med ?? 0).toFixed(1);
+  const p95 = (dur['p(95)'] ?? 0).toFixed(1);
+  const p99 = (dur['p(99)'] ?? 0).toFixed(1);
+  const errRate = (((data.metrics.error_rate?.values?.rate ?? 0)) * 100).toFixed(2);
+  const totalReqs = data.metrics.http_reqs?.values?.count ?? 0;
+
   return {
     stdout: `
 ========================================
   OpsTriage Load Test Summary
 ========================================
-  p50  latency: ${data.metrics.http_req_duration.values['p(50)'].toFixed(1)} ms
-  p95  latency: ${data.metrics.http_req_duration.values['p(95)'].toFixed(1)} ms
-  p99  latency: ${data.metrics.http_req_duration.values['p(99)'].toFixed(1)} ms
-  Error rate:   ${(data.metrics.error_rate.values.rate * 100).toFixed(2)}%
+  p50  latency: ${p50} ms
+  p95  latency: ${p95} ms
+  p99  latency: ${p99} ms
+  Error rate:   ${errRate}%
   Cache hits:   ${cacheHitTotal} / ${totalCacheRequests} (${hitRate}%)
-  Total reqs:   ${data.metrics.http_reqs.values.count}
+  Total reqs:   ${totalReqs}
 ========================================
 `,
   };

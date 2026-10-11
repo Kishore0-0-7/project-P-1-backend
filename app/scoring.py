@@ -28,7 +28,7 @@ _BANDS = [
 ]
 
 _SEVERITY_BOOST = {
-    "critical": 600,
+    "critical": 650,
     "high": 400,
     "medium": 200,
     "low": 50,

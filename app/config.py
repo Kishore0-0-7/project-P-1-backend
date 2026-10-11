@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     worker_concurrency: int = 4          # background task parallelism
     ingest_batch_size: int = 500
 
+    # ── AI / Gemini Service ───────────────────────────────────────────────────
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.1-flash-lite"
+    ai_enabled: bool = True
+    ai_timeout_seconds: float = 15.0
+    ai_max_output_tokens: int = 1500
+
     # ── Validators ────────────────────────────────────────────────────────────
     @field_validator("database_url", mode="before")
     @classmethod

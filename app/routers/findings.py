@@ -14,14 +14,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import cache as redis
 from app.config import settings
 from app.db import get_db, set_org_context
-from app.models import Finding, FindingOccurrence
+from app.models import Asset, Finding, FindingOccurrence
 from app.schemas import (
     FindingCreate,
     FindingOut,
@@ -57,6 +57,7 @@ async def _require_finding(
 
 @router.get("", response_model=list[FindingOut], summary="List findings")
 async def list_findings(
+    response: Response,
     org_id: str = Query(..., description="Organization UUID"),
     status_filter: list[str] | None = Query(None, alias="status"),
     severity: list[str] | None = Query(None),
@@ -71,10 +72,17 @@ async def list_findings(
     )
     cached = await redis.cache_get(cache_key)
     if cached:
+        response.headers["X-Cache-Status"] = "HIT"
         return [FindingOut.model_validate(item) for item in cached]
 
+    response.headers["X-Cache-Status"] = "MISS"
+
     await set_org_context(db, org_id)
-    q = select(Finding).where(Finding.org_id == uuid.UUID(org_id))
+    q = (
+        select(Finding, Asset.name.label("asset_name"), Asset.asset_type.label("asset_type"))
+        .outerjoin(Asset, Finding.asset_id == Asset.id)
+        .where(Finding.org_id == uuid.UUID(org_id))
+    )
 
     if status_filter:
         q = q.where(Finding.status.in_(status_filter))
@@ -84,8 +92,13 @@ async def list_findings(
         q = q.where(Finding.asset_id == asset_id)
 
     q = q.order_by(Finding.priority, Finding.last_seen_at.desc()).offset(offset).limit(limit)
-    rows = (await db.scalars(q)).all()
-    out = [FindingOut.model_validate(r) for r in rows]
+    res = (await db.execute(q)).all()
+    out = []
+    for f_row, a_name, a_type in res:
+        item = FindingOut.model_validate(f_row)
+        item.asset_name = a_name
+        item.asset_type = a_type
+        out.append(item)
     await redis.cache_set(cache_key, [o.model_dump(mode="json") for o in out], ttl=settings.redis_findings_ttl)
     return out
 
@@ -100,7 +113,13 @@ async def get_finding(
 ) -> FindingOut:
     await set_org_context(db, org_id)
     row = await _require_finding(finding_id, org_id, db)
-    return FindingOut.model_validate(row)
+    out = FindingOut.model_validate(row)
+    if row.asset_id:
+        asset_row = await db.get(Asset, row.asset_id)
+        if asset_row:
+            out.asset_name = asset_row.name
+            out.asset_type = asset_row.asset_type
+    return out
 
 
 # ── create ────────────────────────────────────────────────────────────────────
@@ -114,10 +133,16 @@ async def create_finding(
 ) -> FindingOut:
     await set_org_context(db, org_id)
 
-    # Re-score using the engine (caller may provide their own score too)
+    crit = 3
+    if body.asset_id:
+        asset = await db.get(Asset, body.asset_id)
+        if asset and str(asset.org_id) == org_id:
+            crit = asset.criticality
+
+    # Re-score using the engine with actual asset criticality
     result = score_finding(
         severity=body.severity,
-        asset_criticality=3,  # default; enrich from assets table if asset_id present
+        asset_criticality=crit,
         occurrence_count=1,
     )
 
@@ -165,9 +190,20 @@ async def update_finding(
     for field, value in update_data.items():
         setattr(row, field, value)
 
+    from app.models import AuditEvent
+    db.add(AuditEvent(
+        org_id=uuid.UUID(org_id),
+        entity_type="finding",
+        entity_id=row.id,
+        action="status_updated",
+        after_state={"status": row.status, "priority": row.priority},
+    ))
+
     await db.commit()
     await db.refresh(row)
     background_tasks.add_task(redis.invalidate_prefix, f"findings:{org_id}")
+    background_tasks.add_task(redis.invalidate_prefix, f"assets:{org_id}")
+    background_tasks.add_task(redis.invalidate_prefix, f"reports:{org_id}")
     return FindingOut.model_validate(row)
 
 
@@ -230,3 +266,63 @@ async def list_occurrences(
     )
     rows = (await db.scalars(q)).all()
     return [OccurrenceOut.model_validate(r) for r in rows]
+
+
+@router.get(
+    "/{finding_id}/source-event",
+    response_model=dict,
+    summary="Get the raw telemetry event that triggered this finding",
+)
+async def get_source_event(
+    finding_id: uuid.UUID,
+    org_id: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    from app.models import RawEvent
+    await set_org_context(db, org_id)
+    finding = await _require_finding(finding_id, org_id, db)
+
+    occ_q = (
+        select(FindingOccurrence)
+        .where(
+            FindingOccurrence.org_id == uuid.UUID(org_id),
+            FindingOccurrence.finding_id == finding_id,
+            FindingOccurrence.raw_event_id.isnot(None),
+        )
+        .order_by(FindingOccurrence.observed_at.asc())
+        .limit(1)
+    )
+    occ = (await db.scalars(occ_q)).first()
+    if not occ or not occ.raw_event_id:
+        return {
+            "finding_id": str(finding.id),
+            "source": "evidence_snapshot",
+            "occurred_at": finding.first_seen_at.isoformat() if finding.first_seen_at else None,
+            "payload": finding.evidence,
+            "raw_event_id": None,
+        }
+
+    raw = await db.get(RawEvent, occ.raw_event_id)
+    if not raw:
+        return {
+            "finding_id": str(finding.id),
+            "source": "occurrence_record",
+            "occurred_at": occ.observed_at.isoformat(),
+            "payload": occ.evidence,
+            "raw_event_id": str(occ.raw_event_id),
+        }
+
+    return {
+        "finding_id": str(finding.id),
+        "raw_event_id": str(raw.id),
+        "source": raw.source,
+        "source_event_id": raw.source_event_id,
+        "event_type": raw.event_type,
+        "occurred_at": raw.occurred_at.isoformat() if raw.occurred_at else None,
+        "received_at": raw.received_at.isoformat() if raw.received_at else None,
+        "payload": raw.payload,
+        "processing_status": raw.processing_status,
+        "triggering_metric": occ.metric,
+        "triggering_value": occ.value,
+    }
+

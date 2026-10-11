@@ -50,6 +50,8 @@ class CounterfactualSimulationResult:
     breach_reduction_pct: float
     p95_improvement_minutes: float
     high_priority_sla_compliance_pct: float
+    preempted_count: int = 0
+    mttr_saved_minutes: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -303,6 +305,8 @@ def simulate_sla_counterfactual(
         breach_reduction_pct=reduction_pct,
         p95_improvement_minutes=p95_diff,
         high_priority_sla_compliance_pct=high_prio_compliance,
+        preempted_count=breach_reduction,
+        mttr_saved_minutes=max(0.0, p95_diff),
     )
 
 

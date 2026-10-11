@@ -28,7 +28,7 @@ from fastapi.responses import ORJSONResponse
 from app import cache as redis_cache
 from app.config import settings
 from app.db import shutdown_db, startup_db
-from app.routers import ai, assets, auth, cases, findings, health, incidents, ingest, reports, rules
+from app.routers import ai, assets, auth, cases, findings, health, incidents, ingest, integrations, reports, rules
 
 logging.basicConfig(
     level=logging.DEBUG if settings.debug else logging.INFO,
@@ -180,3 +180,4 @@ app.include_router(ingest.router, prefix=API_PREFIX)
 app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(rules.router, prefix=API_PREFIX)
 app.include_router(ai.router, prefix=API_PREFIX)
+app.include_router(integrations.router, prefix=API_PREFIX)
