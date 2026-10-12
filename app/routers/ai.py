@@ -31,6 +31,8 @@ from app.schemas import (
     HvacEvalResponse,
     InvestigateCaseRequest,
     SummarizeEvidenceRequest,
+    SupportChatRequest,
+    SupportChatResponse,
 )
 from app.services.ai_assistant import (
     AIAssistanceError,
@@ -38,9 +40,25 @@ from app.services.ai_assistant import (
     follow_up_conversation,
     investigate_case,
     summarize_case_evidence,
+    support_chat,
 )
 
 router = APIRouter(prefix="/ai", tags=["ai"])
+
+
+@router.post("/support-chat", response_model=SupportChatResponse, summary="Authenticated product support chat")
+async def support_chat_endpoint(
+    body: SupportChatRequest,
+    _current_user: AuthenticatedUser = Depends(get_current_user),
+) -> SupportChatResponse:
+    """Provide product help without reading workspace or tenant data."""
+    try:
+        return await support_chat(body.question, body.conversation_history)
+    except AIAssistanceError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"error_code": exc.error_code, "message": exc.detail},
+        )
 
 # ── Persisted Benchmark Run Registry ──────────────────────────────────────────
 # Persists benchmark runs for auditability and reproducibility verification

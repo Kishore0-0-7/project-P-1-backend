@@ -73,6 +73,12 @@ async def create_tables():
 
 @pytest_asyncio.fixture
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
+    # Endpoints commit their own transactions, so rollback alone cannot isolate
+    # tests against the session-scoped in-memory database. Clear it before each
+    # test to prevent one test's records from changing another test's baseline.
+    async with TEST_ENGINE.begin() as conn:
+        for table in reversed(Base.metadata.sorted_tables):
+            await conn.execute(table.delete())
     async with TEST_SESSION_FACTORY() as session:
         yield session
         await session.rollback()  # isolate tests

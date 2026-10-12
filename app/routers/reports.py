@@ -395,7 +395,7 @@ async def get_system_posture(
 @router.get("/timeline", summary="Signal intake volume timeline")
 async def get_intake_timeline(
     org_id: str = Query(...),
-    hours: int = Query(12, ge=1, le=72),
+    hours: int = Query(12, ge=1, le=168),
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
     await set_org_context(db, org_id)

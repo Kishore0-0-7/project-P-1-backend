@@ -69,7 +69,9 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.1-flash-lite"
     ai_enabled: bool = True
-    ai_timeout_seconds: float = 15.0
+    ai_timeout_seconds: float = 60.0
+    # Product support answers can take longer than short inline AI assists.
+    support_chat_timeout_seconds: float = 60.0
     ai_max_output_tokens: int = 1500
 
     # ── Validators ────────────────────────────────────────────────────────────

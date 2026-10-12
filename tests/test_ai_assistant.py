@@ -42,6 +42,7 @@ from app.services.ai_assistant import (
     redact_secrets,
     sanitize_input,
     set_genai_client,
+    support_chat,
     summarize_case_evidence,
 )
 
@@ -304,6 +305,48 @@ async def test_workspace(client: AsyncClient, db_session: AsyncSession):
 
 
 class TestAIAssistantEndpoints:
+    @pytest.mark.asyncio
+    async def test_organization_member_list_is_scoped_to_current_tenant(self, client: AsyncClient, test_workspace):
+        headers = {"Authorization": f"Bearer {test_workspace['token']}"}
+        response = await client.get("/api/v1/auth/users", headers=headers)
+        assert response.status_code == 200
+        assert response.json()
+        assert all(user["org_id"] == test_workspace["org_id"] for user in response.json())
+        assert any(user["email"].startswith("operator-") for user in response.json())
+
+    @pytest.mark.asyncio
+    async def test_support_chat_uses_its_dedicated_timeout(self):
+        mock_client = MagicMock()
+        async def slow_reply(**kwargs):
+            await asyncio.sleep(0.05)
+            return make_mock_ai_response(text="Hello")
+        mock_client.aio.models.generate_content = AsyncMock(side_effect=slow_reply)
+        set_genai_client(mock_client)
+        try:
+            with patch.object(settings, "ai_enabled", True), \
+                 patch.object(settings, "support_chat_timeout_seconds", 0.001):
+                with pytest.raises(AIAssistanceError) as exc_info:
+                    await support_chat("Hi", [])
+            assert exc_info.value.status_code == 504
+            assert "0.001 seconds" in exc_info.value.detail
+        finally:
+            set_genai_client(None)
+
+    @pytest.mark.asyncio
+    async def test_support_chat_requires_auth_and_passes_chat_payload(self, client: AsyncClient, test_workspace):
+        unauthorized = await client.post("/api/v1/ai/support-chat", json={"question": "How do I open a case?"})
+        assert unauthorized.status_code == 401
+
+        with patch("app.routers.ai.support_chat", new=AsyncMock(return_value={"answer": "Select a finding and choose Escalate to Case.", "model_used": "test-model"})) as chat:
+            response = await client.post(
+                "/api/v1/ai/support-chat",
+                headers={"Authorization": f"Bearer {test_workspace['token']}"},
+                json={"question": "How do I open a case?", "conversation_history": []},
+            )
+        assert response.status_code == 200
+        assert response.json()["answer"].startswith("Select a finding")
+        chat.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_explain_signal_endpoint_success(self, client: AsyncClient, test_workspace):
         mock_client = MagicMock()

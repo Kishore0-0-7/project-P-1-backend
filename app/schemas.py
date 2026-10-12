@@ -191,6 +191,11 @@ class RuleOut(_Base):
     enabled: bool
     stage: str = "active"
     active_version_id: uuid.UUID | None
+    engine: str | None = None
+    version: int | None = None
+    findings: int = 0
+    resolved_findings: int = 0
+    effectiveness: float | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -332,14 +337,14 @@ class CaseCreate(_Base):
     @field_validator("assigned_to", mode="before")
     @classmethod
     def parse_assigned_to(cls, v: Any) -> uuid.UUID | None:
-        if not v:
+        if v is None:
             return None
         if isinstance(v, uuid.UUID):
             return v
         try:
             return uuid.UUID(str(v))
-        except (ValueError, TypeError):
-            return None
+        except (ValueError, TypeError) as exc:
+            raise ValueError("assigned_to must be a user UUID or null") from exc
 
 
 class CaseUpdate(_Base):
@@ -352,14 +357,14 @@ class CaseUpdate(_Base):
     @field_validator("assigned_to", mode="before")
     @classmethod
     def parse_assigned_to(cls, v: Any) -> uuid.UUID | None:
-        if not v:
+        if v is None:
             return None
         if isinstance(v, uuid.UUID):
             return v
         try:
             return uuid.UUID(str(v))
-        except (ValueError, TypeError):
-            return None
+        except (ValueError, TypeError) as exc:
+            raise ValueError("assigned_to must be a user UUID or null") from exc
 
 
 
@@ -406,6 +411,8 @@ class RawEventOut(_Base):
     occurred_at: datetime
     received_at: datetime
     processing_status: str
+    source_event_id: str | None = None
+    processing_error: str | None = None
     payload: dict[str, Any] | None = None
     matched_findings: list[uuid.UUID] = Field(default_factory=list)
     is_synthetic: bool = False
@@ -421,6 +428,9 @@ class IngestBatchOut(_Base):
     rejected: int
     ids: list[uuid.UUID]
     triggered_findings: int = 0
+    processed: int = 0
+    failed: int = 0
+    pending: int = 0
 
 
 class IngestMetricsOut(_Base):
@@ -428,8 +438,8 @@ class IngestMetricsOut(_Base):
     processed_count: int
     pending_count: int
     failed_count: int
-    p95_latency_ms: float
-    avg_latency_ms: float
+    p95_latency_ms: float | None
+    avg_latency_ms: float | None
     sources_breakdown: dict[str, int]
     recent_errors: list[dict[str, Any]] = Field(default_factory=list)
     stages_breakdown: dict[str, float] = Field(default_factory=dict)
@@ -659,6 +669,16 @@ class FollowUpResponse(_Base):
     confidence_assessment: str = Field(..., description="Evaluation of certainty and telemetry gaps")
     validated_evidence_ids: list[str] = Field(default_factory=list, description="IDs of database records cited in answer")
     model_used: str = "gemini-3.1-flash-lite"
+
+
+class SupportChatRequest(_Base):
+    question: str = Field(..., min_length=1, max_length=1000)
+    conversation_history: list[FollowUpMessage] = Field(default_factory=list, max_length=12)
+
+
+class SupportChatResponse(_Base):
+    answer: str = Field(..., min_length=1, max_length=6000)
+    model_used: str
 
 
 # ── Authentication & Security ─────────────────────────────────────────────────

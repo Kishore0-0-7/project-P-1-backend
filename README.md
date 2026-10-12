@@ -21,7 +21,7 @@ Once the server is running, explore and execute requests interactively:
 | Tag | Description | Primary Endpoints |
 | :--- | :--- | :--- |
 | `auth` | JWT authentication, login/logout session lifecycle, registration, organization user creation, and role management | `POST /api/v1/auth/login`, `POST /api/v1/auth/register`, `POST /api/v1/auth/users`, `POST /api/v1/auth/refresh`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/me` |
-| `ai` | Explainable AI triage, counterfactual queue simulation, and AFDD benchmark evaluation | `POST /api/v1/ai/triage`, `POST /api/v1/ai/simulate-sla`, `POST /api/v1/ai/hvac-eval` |
+| `ai` | Explainable AI triage, counterfactual queue simulation, AFDD evaluation, and authenticated product support chat | `POST /api/v1/ai/triage`, `POST /api/v1/ai/simulate-sla`, `POST /api/v1/ai/hvac-eval`, `POST /api/v1/ai/support-chat` |
 | `findings` | Alert deduplication, multi-factor scoring (1–5), and occurrence correlation | `GET/POST /api/v1/findings`, `GET/PATCH /api/v1/findings/{id}` |
 | `cases` | Operational case workflow, engineer assignments, and resolution tracking | `GET/POST /api/v1/cases`, `PATCH /api/v1/cases/{id}` |
 | `incidents` | High-level incident tracking with asset-enriched auto-scoring and SLA countdowns | `GET/POST /api/v1/incidents`, `PATCH /api/v1/incidents/{id}` |
@@ -46,6 +46,8 @@ All settings are managed via Pydantic Settings and loaded exclusively from `back
 | `DB_MAX_OVERFLOW` | `10` | Maximum surge connections permitted above pool size. |
 | `DB_POOL_TIMEOUT` | `30.0` | Connection checkout timeout in seconds. |
 | `DB_POOL_RECYCLE` | `1800` | Connection recycle age (prevents stale Neon connection drops). |
+| `AI_TIMEOUT_SECONDS` | `60.0` | Timeout for inline AI analysis and case follow-ups. |
+| `SUPPORT_CHAT_TIMEOUT_SECONDS` | `60.0` | Dedicated timeout for product support chat; increase this if Gemini responds slowly. |
 | `REDIS_URL` | `rediss://default:<password>@<host>:<port>` | Hosted Redis/Valkey caching instance. Use `rediss://` for TLS; gracefully falls back if Redis is offline. |
 | `REDIS_FINDINGS_TTL` | `10` | Cache TTL in seconds for near-real-time triage views. |
 | `REDIS_REPORTS_TTL` | `300` | Cache TTL in seconds for heavy aggregation reports. |

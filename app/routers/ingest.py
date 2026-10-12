@@ -9,6 +9,7 @@ GET  /ingest/health       raw status counts
 from __future__ import annotations
 
 import logging
+import math
 import time
 import uuid
 from datetime import datetime, timezone
@@ -20,8 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import cache as redis
 from app.db import get_db, set_org_context
-from app.models import RawEvent, Rule
-from app.rules_engine import evaluate_event_and_correlate
+from app.models import RawEvent, Rule, RuleVersion
+from app.rules_engine import evaluate_event_and_correlate, load_active_rule_pairs
 from app.schemas import (
     IngestBatchCreate,
     IngestBatchOut,
@@ -57,6 +58,7 @@ async def _store_and_process_event(
     ev: RawEventCreate,
     org_id: str,
     db: AsyncSession,
+    active_rule_pairs: list[tuple[Rule, RuleVersion]] | None = None,
 ) -> tuple[RawEvent, list[uuid.UUID]]:
     cleaned_payload = _validate_event_payload(ev)
     org_uuid = uuid.UUID(org_id)
@@ -70,6 +72,8 @@ async def _store_and_process_event(
         occurred_at=ev.occurred_at or datetime.now(tz=timezone.utc),
         received_at=datetime.now(tz=timezone.utc),
         payload=cleaned_payload,
+        is_synthetic=ev.is_synthetic,
+        provenance=ev.provenance,
         processing_status="pending",
     )
     db.add(row)
@@ -78,15 +82,19 @@ async def _store_and_process_event(
     # Rule evaluation & finding correlation
     matched_finding_ids: list[uuid.UUID] = []
     try:
-        matched_finding_ids = await evaluate_event_and_correlate(
-            event_id=row.id,
-            org_id=org_uuid,
-            asset_id=row.asset_id,
-            source=row.source,
-            payload=cleaned_payload,
-            occurred_at=row.occurred_at,
-            db=db,
-        )
+        # Keep rule effects atomic per event while allowing the raw event itself
+        # to be retained with a failed status for diagnosis.
+        async with db.begin_nested():
+            matched_finding_ids = await evaluate_event_and_correlate(
+                event_id=row.id,
+                org_id=org_uuid,
+                asset_id=row.asset_id,
+                source=row.source,
+                payload=cleaned_payload,
+                occurred_at=row.occurred_at,
+                db=db,
+                active_rule_pairs=active_rule_pairs,
+            )
         row.processing_status = "processed"
         row.processed_at = datetime.now(tz=timezone.utc)
     except Exception as exc:
@@ -120,7 +128,6 @@ async def ingest_event(
     background_tasks.add_task(redis.invalidate_prefix, f"assets:{org_id}")
 
     res = RawEventOut.model_validate(row)
-    res.processing_status = "pending"
     res.matched_findings = matched_findings
     return res
 
@@ -144,13 +151,40 @@ async def ingest_batch(
             detail="Validation error: Batch must contain at least 1 event.",
         )
 
+    # Reject malformed batches before any row is inserted, so clients can
+    # correct the batch without leaving a partially persisted request behind.
+    invalid_events = []
+    for index, event in enumerate(body.events):
+        try:
+            _validate_event_payload(event)
+        except HTTPException as exc:
+            invalid_events.append(f"event {index}: {exc.detail}")
+    if invalid_events:
+        raise HTTPException(status_code=422, detail="; ".join(invalid_events))
+
     accepted_ids: list[uuid.UUID] = []
     total_triggered = 0
+    processed_count = 0
+    failed_count = 0
+    pending_count = 0
 
+    # Rules are stable for the duration of this request. Fetch them once,
+    # rather than issuing the same query for each telemetry event.
+    try:
+        async with db.begin_nested():
+            active_rule_pairs = await load_active_rule_pairs(uuid.UUID(org_id), db)
+    except Exception:
+        # Preserve per-event failure reporting if the optimization query itself
+        # fails. Each event will then retry rule loading inside its savepoint.
+        logger.exception("Could not prefetch active rules for ingest batch")
+        active_rule_pairs = None
     for ev in body.events:
-        row, matched = await _store_and_process_event(ev, org_id, db)
+        row, matched = await _store_and_process_event(ev, org_id, db, active_rule_pairs)
         accepted_ids.append(row.id)
         total_triggered += len(matched)
+        processed_count += row.processing_status == "processed"
+        failed_count += row.processing_status == "failed"
+        pending_count += row.processing_status == "pending"
 
     await db.commit()
 
@@ -163,6 +197,9 @@ async def ingest_batch(
         rejected=0,
         ids=accepted_ids,
         triggered_findings=total_triggered,
+        processed=processed_count,
+        failed=failed_count,
+        pending=pending_count,
     )
 
 
@@ -203,25 +240,24 @@ async def ingest_metrics(
     source_res = (await db.execute(source_q)).all()
     sources_breakdown = {r[0]: r[1] for r in source_res}
 
-    # Processing latency
-    if dialect_name == "sqlite":
-        p95_ms = 42.0
-        avg_ms = 28.5
-    else:
-        latency_sql = text("""
-            SELECT
-                COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (
-                    ORDER BY GREATEST(EXTRACT(EPOCH FROM (processed_at - received_at)) * 1000.0, 1.0)
-                ), 38.0) AS p95_ms,
-                COALESCE(AVG(GREATEST(EXTRACT(EPOCH FROM (processed_at - received_at)) * 1000.0, 1.0)), 24.0) AS avg_ms
-            FROM opstriage.raw_events
-            WHERE org_id = :org_id
-              AND processed_at IS NOT NULL
-              AND processed_at >= received_at
-        """)
-        lat_res = (await db.execute(latency_sql, {"org_id": org_id})).fetchone()
-        p95_ms = round(float(lat_res[0]), 1) if lat_res and lat_res[0] is not None else 38.0
-        avg_ms = round(float(lat_res[1]), 1) if lat_res and lat_res[1] is not None else 24.0
+    # Use a bounded recent sample so latency stays responsive as history grows.
+    latency_rows = (await db.execute(
+        select(RawEvent.received_at, RawEvent.processed_at)
+        .where(
+            RawEvent.org_id == uuid.UUID(org_id),
+            RawEvent.processed_at.is_not(None),
+            RawEvent.processed_at >= RawEvent.received_at,
+        )
+        .order_by(RawEvent.processed_at.desc())
+        .limit(2000)
+    )).all()
+    latency_samples = sorted(
+        max((processed_at - received_at).total_seconds() * 1000.0, 1.0)
+        for received_at, processed_at in latency_rows
+        if received_at is not None and processed_at is not None
+    )
+    avg_ms = round(sum(latency_samples) / len(latency_samples), 1) if latency_samples else None
+    p95_ms = round(latency_samples[max(0, math.ceil(len(latency_samples) * 0.95) - 1)], 1) if latency_samples else None
 
     # Recent errors
     err_q = (
@@ -269,13 +305,9 @@ async def ingest_metrics(
     rules_count_q = select(func.count(Rule.id)).where(Rule.org_id == uuid.UUID(org_id), Rule.enabled == True)
     rules_eval_count = (await db.scalar(rules_count_q)) or 0
 
-    # Traced ingestion stages breakdown
-    stages_breakdown = {
-        "payload_validation_ms": round(max(0.4, avg_ms * 0.04), 1),
-        "raw_event_storage_ms": round(max(1.2, avg_ms * 0.42), 1),
-        "rule_correlation_ms": round(max(1.0, avg_ms * 0.36), 1),
-        "commit_and_cache_ms": round(max(0.5, avg_ms * 0.18), 1),
-    }
+    # Stage timings are not instrumented yet. Leave them absent rather than
+    # deriving synthetic values from whole-request latency.
+    stages_breakdown: dict[str, float] = {}
 
     return IngestMetricsOut(
         total_events=total,

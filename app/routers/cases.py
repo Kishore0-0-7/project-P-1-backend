@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import cache as redis
 from app.db import get_db, set_org_context
-from app.models import Asset, AuditEvent, Case, CaseEvent, CaseFinding, Finding, User
+from app.models import Asset, AuditEvent, Case, CaseEvent, CaseFinding, Finding, OrganizationMembership, User
 from app.schemas import CaseCreate, CaseOut, CaseUpdate
 
 router = APIRouter(prefix="/cases", tags=["cases"])
@@ -112,6 +112,19 @@ async def _require_case(case_id: str, org_id: str, db: AsyncSession) -> Case:
     return row
 
 
+async def _validate_assignee(assignee_id: uuid.UUID | None, org_id: str, db: AsyncSession) -> None:
+    if assignee_id is None:
+        return
+    membership = await db.scalar(
+        select(OrganizationMembership.user_id).where(
+            OrganizationMembership.org_id == uuid.UUID(org_id),
+            OrganizationMembership.user_id == assignee_id,
+        )
+    )
+    if membership is None:
+        raise HTTPException(status_code=422, detail="Case owner must be an active member of this organization.")
+
+
 @router.get("", response_model=list[CaseOut], summary="List cases")
 async def list_cases(
     org_id: str = Query(...),
@@ -151,6 +164,7 @@ async def create_case(
     db: AsyncSession = Depends(get_db),
 ) -> CaseOut:
     await set_org_context(db, org_id)
+    await _validate_assignee(body.assigned_to, org_id, db)
 
     case = Case(
         org_id=uuid.UUID(org_id),
@@ -205,7 +219,9 @@ async def update_case(
 ) -> CaseOut:
     await set_org_context(db, org_id)
     row = await _require_case(case_id, org_id, db)
-    update_data = body.model_dump(exclude_none=True)
+    update_data = body.model_dump(exclude_unset=True)
+    if "assigned_to" in update_data:
+        await _validate_assignee(update_data["assigned_to"], org_id, db)
 
     old_status = row.status
     old_assignee = row.assigned_to

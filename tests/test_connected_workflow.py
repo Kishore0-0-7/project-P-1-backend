@@ -15,6 +15,10 @@ from datetime import datetime, timezone
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import Organization, OrganizationMembership, User
+from tests.conftest import db_session
 
 WORKFLOW_ORG_ID = str(uuid.uuid4())
 
@@ -95,7 +99,7 @@ class TestConnectedOperationalWorkflow:
         assert test_non_matching.json()["matched"] is False
 
     async def test_full_connected_lifecycle_event_to_case_to_resolution(
-        self, client: AsyncClient
+        self, client: AsyncClient, db_session: AsyncSession
     ):
         """
         Connected operational workflow acceptance test:
@@ -109,6 +113,24 @@ class TestConnectedOperationalWorkflow:
         8. Resolve the case
         9. Verify linked finding is resolved and asset health/risk is restored
         """
+        # Assignment is intentionally restricted to organization members.
+        org_uuid = uuid.UUID(WORKFLOW_ORG_ID)
+        engineer_id = uuid.uuid4()
+        db_session.add(Organization(
+            id=org_uuid,
+            slug=f"workflow-{org_uuid.hex[:10]}",
+            name="Workflow Test Organization",
+            settings={},
+        ))
+        db_session.add(User(
+            id=engineer_id,
+            external_subject=f"workflow|{engineer_id}",
+            email="engineer@workflow.example.test",
+            display_name="Workflow Engineer",
+        ))
+        db_session.add(OrganizationMembership(org_id=org_uuid, user_id=engineer_id, role="operator"))
+        await db_session.flush()
+
         # 1. Create asset
         asset_res = await client.post(
             "/api/v1/assets",
@@ -218,7 +240,7 @@ class TestConnectedOperationalWorkflow:
         assert finding_id in case_res.json()["finding_ids"]
 
         # 7. Assign the case
-        test_engineer_id = str(uuid.uuid4())
+        test_engineer_id = str(engineer_id)
         assign_res = await client.patch(
             f"/api/v1/cases/{case_id}",
             params={"org_id": WORKFLOW_ORG_ID},

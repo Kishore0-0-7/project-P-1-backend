@@ -8,8 +8,11 @@ from datetime import datetime, timezone
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tests.conftest import ORG_ID
+from app.models import Case, Organization, OrganizationMembership, User
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -17,6 +20,31 @@ from tests.conftest import ORG_ID
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestCases:
+    @pytest.mark.asyncio
+    async def test_assign_and_unassign_case_owner(self, client: AsyncClient, db_session: AsyncSession):
+        org_id = uuid.uuid4()
+        org_id_value = str(org_id)
+        user_id = uuid.uuid4()
+        db_session.add(Organization(id=org_id, slug=f"test-{org_id.hex[:8]}", name="Test Org", settings={}))
+        db_session.add(User(id=user_id, external_subject=f"local|{user_id}", email="owner@example.test", display_name="Case Owner"))
+        db_session.add(OrganizationMembership(org_id=org_id, user_id=user_id, role="operator"))
+        await db_session.flush()
+
+        created = await client.post("/api/v1/cases", params={"org_id": org_id_value}, json={"title": "Assign me", "priority": 2})
+        case_id = created.json()["id"]
+        assigned = await client.patch(
+            f"/api/v1/cases/{case_id}", params={"org_id": org_id_value}, json={"assigned_to": str(user_id)}
+        )
+        assert assigned.status_code == 200
+        assert assigned.json()["assigned_to"] == str(user_id)
+        assert assigned.json()["assignee_name"] == "Case Owner"
+
+        unassigned = await client.patch(
+            f"/api/v1/cases/{case_id}", params={"org_id": org_id_value}, json={"assigned_to": None}
+        )
+        assert unassigned.status_code == 200
+        assert unassigned.json()["assigned_to"] is None
+
     @pytest.mark.asyncio
     async def test_list_cases_empty(self, client: AsyncClient):
         resp = await client.get("/api/v1/cases", params={"org_id": ORG_ID})
@@ -226,7 +254,7 @@ class TestIngest:
         resp = await client.post("/api/v1/ingest/events", params={"org_id": ORG_ID}, json=self._event())
         assert resp.status_code == 202
         data = resp.json()
-        assert data["processing_status"] == "pending"
+        assert data["processing_status"] == "processed"
         assert data["source"] == "hvac-sensor"
 
     @pytest.mark.asyncio
@@ -238,6 +266,22 @@ class TestIngest:
         assert data["accepted"] == 10
         assert data["rejected"] == 0
         assert len(data["ids"]) == 10
+        assert data["processed"] == 10
+        assert data["failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_ingest_batch_validates_all_events_before_persisting(self, client: AsyncClient):
+        before = await client.get("/api/v1/ingest/metrics", params={"org_id": ORG_ID})
+        assert before.status_code == 200
+        existing_count = before.json()["total_events"]
+        resp = await client.post(
+            "/api/v1/ingest/events/batch", params={"org_id": ORG_ID},
+            json={"events": [self._event(), self._event(payload={})]},
+        )
+        assert resp.status_code == 422
+        metrics = await client.get("/api/v1/ingest/metrics", params={"org_id": ORG_ID})
+        assert metrics.status_code == 200
+        assert metrics.json()["total_events"] == existing_count
 
     @pytest.mark.asyncio
     async def test_ingest_batch_too_many_events(self, client: AsyncClient):
@@ -341,6 +385,57 @@ class TestRules:
         resp_toggle = await client.patch(f"/api/v1/rules/{rule_id}/toggle", params={"org_id": ORG_ID})
         assert resp_toggle.status_code == 200
         assert resp_toggle.json()["enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_rule_list_returns_measured_resolution_rate_and_version(self, client: AsyncClient):
+        key = f"rule-metric-{uuid.uuid4().hex[:8]}"
+        rule_res = await client.post(
+            "/api/v1/rules",
+            params={"org_id": ORG_ID},
+            json={
+                "key": key,
+                "name": "Measured Resolution Rule",
+                "engine": "threshold",
+                "definition": {"metric": "temp_c", "operator": ">=", "threshold": 30},
+            },
+        )
+        assert rule_res.status_code == 201
+        rule = rule_res.json()
+        assert rule["engine"] == "threshold"
+        assert rule["version"] == 1
+
+        finding_ids = []
+        for index in range(2):
+            finding_res = await client.post(
+                "/api/v1/findings",
+                params={"org_id": ORG_ID},
+                json={
+                    "fingerprint": f"{key}-{index}",
+                    "title": f"Measured finding {index}",
+                    "severity": "high",
+                    "priority": 3,
+                    "priority_score": 500,
+                    "rule_version_id": rule["active_version_id"],
+                },
+            )
+            assert finding_res.status_code == 201
+            finding_ids.append(finding_res.json()["id"])
+
+        resolved_res = await client.patch(
+            f"/api/v1/findings/{finding_ids[0]}",
+            params={"org_id": ORG_ID},
+            json={"status": "resolved"},
+        )
+        assert resolved_res.status_code == 200
+
+        listed = await client.get("/api/v1/rules", params={"org_id": ORG_ID})
+        assert listed.status_code == 200
+        measured = next(item for item in listed.json() if item["id"] == rule["id"])
+        assert measured["findings"] == 2
+        assert measured["resolved_findings"] == 1
+        assert measured["effectiveness"] == 50.0
+        assert measured["engine"] == "threshold"
+        assert measured["version"] == 1
 
     @pytest.mark.asyncio
     async def test_create_rule_version(self, client: AsyncClient):

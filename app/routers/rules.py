@@ -9,12 +9,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import get_db, set_org_context
-from app.models import AuditEvent, RawEvent, Rule, RuleVersion
+from app.models import AuditEvent, Finding, RawEvent, Rule, RuleVersion
 from app.schemas import (
     RuleCreate,
     RuleDryRunMatchItem,
@@ -30,6 +30,70 @@ from app.schemas import (
 logger = logging.getLogger("opstriage.rules")
 
 router = APIRouter(prefix="/rules", tags=["rules"])
+
+
+async def _enrich_rules(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    *,
+    enabled: bool | None = None,
+    rule_id: uuid.UUID | None = None,
+    limit: int = 100,
+) -> list[RuleOut]:
+    """Attach the active version and observed finding-resolution metrics."""
+    await set_org_context(db, str(org_id))
+    finding_stats = (
+        select(
+            RuleVersion.rule_id.label("rule_id"),
+            func.count(Finding.id).label("finding_count"),
+            func.count(Finding.id).filter(Finding.status == "resolved").label("resolved_count"),
+        )
+        .select_from(RuleVersion)
+        .join(
+            Finding,
+            and_(
+                Finding.org_id == RuleVersion.org_id,
+                Finding.rule_version_id == RuleVersion.id,
+            ),
+        )
+        .where(RuleVersion.org_id == org_id)
+        .group_by(RuleVersion.rule_id)
+        .subquery()
+    )
+    q = (
+        select(
+            Rule,
+            RuleVersion.engine.label("engine"),
+            RuleVersion.version.label("version"),
+            func.coalesce(finding_stats.c.finding_count, 0).label("finding_count"),
+            func.coalesce(finding_stats.c.resolved_count, 0).label("resolved_count"),
+        )
+        .outerjoin(
+            RuleVersion,
+            and_(RuleVersion.org_id == Rule.org_id, RuleVersion.id == Rule.active_version_id),
+        )
+        .outerjoin(finding_stats, finding_stats.c.rule_id == Rule.id)
+        .where(Rule.org_id == org_id)
+    )
+    if enabled is not None:
+        q = q.where(Rule.enabled == enabled)
+    if rule_id is not None:
+        q = q.where(Rule.id == rule_id)
+    rows = (await db.execute(q.order_by(Rule.name).limit(limit))).all()
+
+    result: list[RuleOut] = []
+    for rule, engine, version, finding_count, resolved_count in rows:
+        resolution_rate = (resolved_count / finding_count * 100) if finding_count else None
+        rule_data = RuleOut.model_validate(rule).model_dump()
+        rule_data.update({
+            "engine": engine,
+            "version": version,
+            "findings": finding_count,
+            "resolved_findings": resolved_count,
+            "effectiveness": round(resolution_rate, 1) if resolution_rate is not None else None,
+        })
+        result.append(RuleOut(**rule_data))
+    return result
 
 
 def validate_rule_definition(engine: str, definition: dict[str, Any]) -> None:
@@ -95,13 +159,7 @@ async def list_rules(
     limit: int = Query(100, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ) -> list[RuleOut]:
-    await set_org_context(db, org_id)
-    q = select(Rule).where(Rule.org_id == uuid.UUID(org_id))
-    if enabled is not None:
-        q = q.where(Rule.enabled == enabled)
-    q = q.order_by(Rule.name).limit(limit)
-    rows = (await db.scalars(q)).all()
-    return [RuleOut.model_validate(r) for r in rows]
+    return await _enrich_rules(db, uuid.UUID(org_id), enabled=enabled, limit=limit)
 
 
 @router.post("", response_model=RuleOut, status_code=status.HTTP_201_CREATED, summary="Create rule")
@@ -149,7 +207,7 @@ async def create_rule(body: RuleCreate, org_id: str = Query(...), db: AsyncSessi
 
     await db.commit()
     await db.refresh(rule)
-    return RuleOut.model_validate(rule)
+    return (await _enrich_rules(db, rule.org_id, rule_id=rule.id, limit=1))[0]
 
 
 @router.patch("/{rule_id}/toggle", response_model=RuleOut, summary="Toggle rule enabled/disabled")
@@ -197,7 +255,7 @@ async def toggle_rule(rule_id: uuid.UUID, org_id: str = Query(...), db: AsyncSes
     ))
     await db.commit()
     await db.refresh(rule)
-    return RuleOut.model_validate(rule)
+    return (await _enrich_rules(db, rule.org_id, rule_id=rule.id, limit=1))[0]
 
 
 @router.post("/{rule_id}/versions", response_model=RuleVersionOut, status_code=status.HTTP_201_CREATED, summary="Publish a new rule version")
@@ -311,7 +369,7 @@ async def activate_rule_version(
     ))
     await db.commit()
     await db.refresh(rule)
-    return RuleOut.model_validate(rule)
+    return (await _enrich_rules(db, rule.org_id, rule_id=rule.id, limit=1))[0]
 
 
 @router.get("/{rule_id}/versions", response_model=list[RuleVersionOut], summary="List rule versions")

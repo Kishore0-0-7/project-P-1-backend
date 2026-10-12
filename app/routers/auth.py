@@ -103,6 +103,29 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)) -> Token
     )
 
 
+@router.get("/users", response_model=list[UserProfileOut], summary="List active organization members")
+async def list_organization_users(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[UserProfileOut]:
+    rows = (await db.execute(
+        select(User, OrganizationMembership.role)
+        .join(OrganizationMembership, OrganizationMembership.user_id == User.id)
+        .where(OrganizationMembership.org_id == current_user.org_id)
+        .order_by(User.display_name, User.email)
+    )).all()
+    return [
+        UserProfileOut(
+            id=user.id,
+            email=user.email,
+            display_name=user.display_name,
+            org_id=current_user.org_id,
+            role=role,
+        )
+        for user, role in rows
+    ]
+
+
 @router.post(
     "/register",
     response_model=TokenResponse,

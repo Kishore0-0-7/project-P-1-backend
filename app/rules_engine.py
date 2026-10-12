@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +25,19 @@ from app.models import Asset, AuditEvent, Finding, FindingOccurrence, Rule, Rule
 from app.scoring import score_finding
 
 logger = logging.getLogger("opstriage.rules_engine")
+
+
+async def load_active_rule_pairs(
+    org_id: uuid.UUID,
+    db: AsyncSession,
+) -> list[tuple[Rule, RuleVersion]]:
+    """Load the enabled rule set once for an ingestion batch."""
+    q = (
+        select(Rule, RuleVersion)
+        .join(RuleVersion, Rule.active_version_id == RuleVersion.id)
+        .where(Rule.org_id == org_id, Rule.enabled.is_(True))
+    )
+    return list((await db.execute(q)).all())
 
 
 def _apply_op(val: float, op: str, thresh: float) -> bool:
@@ -206,6 +219,7 @@ async def evaluate_event_and_correlate(
     payload: dict[str, Any],
     occurred_at: datetime,
     db: AsyncSession,
+    active_rule_pairs: Sequence[tuple[Rule, RuleVersion]] | None = None,
 ) -> list[uuid.UUID]:
     """
     Evaluates an ingested raw event against all active rules in the organization.
@@ -213,15 +227,11 @@ async def evaluate_event_and_correlate(
     Returns the list of triggered finding IDs.
     """
     # 1. Fetch all enabled rules with their active versions
-    q = (
-        select(Rule, RuleVersion)
-        .join(RuleVersion, Rule.active_version_id == RuleVersion.id)
-        .where(
-            Rule.org_id == org_id,
-            Rule.enabled.is_(True),
-        )
+    rule_pairs = (
+        list(active_rule_pairs)
+        if active_rule_pairs is not None
+        else await load_active_rule_pairs(org_id, db)
     )
-    rule_pairs = (await db.execute(q)).all()
     if not rule_pairs:
         return []
 
